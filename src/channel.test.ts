@@ -52,16 +52,16 @@ describe("config adapter", () => {
     expect(account).toEqual({});
   });
 
-  it("isConfigured returns true when joinCode is set", () => {
-    expect(config.isConfigured!({ joinCode: "abc" }, {} as any)).toBe(true);
-  });
-
   it("isConfigured returns true when joinCode and agentName are set", () => {
     expect(config.isConfigured!({ joinCode: "abc", agentName: "Bot" }, {} as any)).toBe(true);
   });
 
   it("isConfigured returns false when joinCode is missing", () => {
-    expect(config.isConfigured!({}, {} as any)).toBe(false);
+    expect(config.isConfigured!({ agentName: "Bot" }, {} as any)).toBe(false);
+  });
+
+  it("isConfigured returns false when agentName is missing", () => {
+    expect(config.isConfigured!({ joinCode: "abc" }, {} as any)).toBe(false);
   });
 
   it("isEnabled returns true by default", () => {
@@ -172,7 +172,20 @@ describe("gateway adapter", () => {
       getStatus: vi.fn(),
       setStatus: vi.fn(),
     };
-    await expect(gateway.startAccount!(ctx as any)).rejects.toThrow("Missing joinCode");
+    await expect(gateway.startAccount!(ctx as any)).rejects.toThrow("Missing joinCode or agentName");
+  });
+
+  it("startAccount throws when agentName is missing", async () => {
+    const ctx = {
+      cfg: {} as any,
+      accountId: "test",
+      account: { joinCode: "abc" } as AccountConfig,
+      abortSignal: new AbortController().signal,
+      runtime: {} as any,
+      getStatus: vi.fn(),
+      setStatus: vi.fn(),
+    };
+    await expect(gateway.startAccount!(ctx as any)).rejects.toThrow("Missing joinCode or agentName");
   });
 
   it("startAccount registers and stores connection", async () => {

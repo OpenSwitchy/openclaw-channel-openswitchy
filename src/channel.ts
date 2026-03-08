@@ -17,28 +17,6 @@ import type {
 
 const DEFAULT_URL = "https://openswitchy.com";
 
-/* ── Resolve agent identity from OpenClaw config ── */
-
-function resolveAgentIdentity(
-  cfg: OpenClawConfig,
-  account: AccountConfig,
-): { name: string; description: string } {
-  // Explicit config takes priority
-  const agents = (cfg as Record<string, unknown>).agents as
-    | { list?: Array<{ id?: string; name?: string; identity?: { name?: string } }> }
-    | undefined;
-
-  // Try to find the agent's name from OpenClaw agents config
-  const firstAgent = agents?.list?.[0];
-  const clawName = firstAgent?.identity?.name || firstAgent?.name;
-
-  // Try to find a description from the agent's workspace/system prompt context
-  const name = account.agentName || clawName || "OpenClawAgent";
-  const description = account.agentDescription || (clawName ? `${clawName} — OpenClaw agent` : `OpenClaw agent: ${name}`);
-
-  return { name, description };
-}
-
 /** Per-account connection state */
 interface ConnectionState {
   apiKey: string;
@@ -79,17 +57,14 @@ async function apiCall<T>(
   return res.json() as Promise<T>;
 }
 
-async function registerAgent(
-  account: AccountConfig,
-  identity: { name: string; description: string },
-): Promise<RegisterResponse> {
+async function registerAgent(account: AccountConfig): Promise<RegisterResponse> {
   const url = account.url || DEFAULT_URL;
   const res = await fetch(`${url}/register`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      name: identity.name,
-      description: identity.description,
+      name: account.agentName,
+      description: account.agentDescription || `OpenClaw agent: ${account.agentName}`,
       joinCode: account.joinCode,
     }),
   });
@@ -293,7 +268,7 @@ export const openswitchyChannel: ChannelPlugin<AccountConfig> = {
     },
 
     isConfigured(account: AccountConfig): boolean {
-      return Boolean(account.joinCode);
+      return Boolean(account.joinCode && account.agentName);
     },
 
     isEnabled(account: AccountConfig): boolean {
@@ -306,15 +281,14 @@ export const openswitchyChannel: ChannelPlugin<AccountConfig> = {
     async startAccount(ctx: ChannelGatewayContext<AccountConfig>): Promise<void> {
       const { account, accountId, abortSignal } = ctx;
 
-      if (!account.joinCode) {
-        throw new Error("[openswitchy] Missing joinCode in config");
+      if (!account.joinCode || !account.agentName) {
+        throw new Error("[openswitchy] Missing joinCode or agentName in config");
       }
 
-      const identity = resolveAgentIdentity(ctx.cfg, account);
       const baseUrl = account.url || DEFAULT_URL;
 
-      ctx.log?.info(`Registering "${identity.name}" at ${baseUrl}`);
-      const reg = await registerAgent(account, identity);
+      ctx.log?.info(`Registering "${account.agentName}" at ${baseUrl}`);
+      const reg = await registerAgent(account);
       ctx.log?.info(
         `Registered as ${reg.name} (${reg.agentId}) in "${reg.orgName}" — status: ${reg.status}`,
       );
