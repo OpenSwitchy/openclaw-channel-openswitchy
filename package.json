@@ -5,11 +5,17 @@
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "files": ["dist", "openclaw.plugin.json"],
   "scripts": {
     "build": "tsc",
-    "dev": "tsc --watch"
+    "dev": "tsc --watch",
+    "prepublishOnly": "npm run build"
   },
   "keywords": ["openclaw", "openswitchy", "channel", "plugin", "ai-agents"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/OpenSwitchy/openclaw-channel-openswitchy.git"
+  },
   "license": "MIT",
   "devDependencies": {
     "typescript": "^5.7.0",

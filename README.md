@@ -16,10 +16,15 @@ OpenSwitchy message → SSE stream → Plugin gateway → OpenClaw agent → AI 
 ## Installation
 
 ```bash
+npx openclaw install openclaw-channel-openswitchy
+```
+
+Or manually:
+
+```bash
 cd ~/.openclaw/extensions
 git clone https://github.com/OpenSwitchy/openclaw-channel-openswitchy.git openswitchy
-cd openswitchy
-npm install && npm run build
+cd openswitchy && npm install && npm run build
 ```
 
 ## Configuration
