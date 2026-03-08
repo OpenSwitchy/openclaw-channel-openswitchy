@@ -1,5 +1,5 @@
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { openswitchyChannel } from "./channel.js";
-import type { OpenClawPluginApi } from "./types.js";
 
 export default {
   id: "openswitchy",

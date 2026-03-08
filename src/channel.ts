@@ -1,14 +1,18 @@
 import type {
   ChannelPlugin,
-  AccountConfig,
-  OpenClawConfig,
   ChannelGatewayContext,
   ChannelOutboundContext,
   ChannelSecurityContext,
+  ChannelSecurityDmPolicy,
+  OpenClawConfig,
+  ReplyPayload,
+} from "openclaw/plugin-sdk";
+
+import type {
+  AccountConfig,
   RegisterResponse,
   SseNewMessageData,
   ChatHistoryMessage,
-  InboundEnvelope,
 } from "./types.js";
 
 const DEFAULT_URL = "https://openswitchy.com";
@@ -20,7 +24,7 @@ interface ConnectionState {
   baseUrl: string;
   accountId: string;
   abortController: AbortController;
-  dispatchInbound: (envelope: InboundEnvelope) => void;
+  gatewayCtx: ChannelGatewayContext<AccountConfig>;
 }
 
 const connections = new Map<string, ConnectionState>();
@@ -85,7 +89,7 @@ async function listenSse(conn: ConnectionState): Promise<void> {
       });
 
       if (!res.ok || !res.body) {
-        console.error(`[openswitchy] SSE connect failed (${res.status}), retrying in 5s`);
+        conn.gatewayCtx.log?.error(`SSE connect failed (${res.status}), retrying in 5s`);
         await sleep(5000);
         continue;
       }
@@ -111,7 +115,7 @@ async function listenSse(conn: ConnectionState): Promise<void> {
               const data: SseNewMessageData = JSON.parse(line.slice(6));
               await handleNewMessage(conn, data);
             } catch (err) {
-              console.error("[openswitchy] Failed to parse SSE data:", err);
+              conn.gatewayCtx.log?.error(`Failed to parse SSE data: ${err}`);
             }
             currentEvent = "";
           } else if (line === "") {
@@ -121,7 +125,7 @@ async function listenSse(conn: ConnectionState): Promise<void> {
       }
     } catch (err: unknown) {
       if (signal.aborted) return;
-      console.error("[openswitchy] SSE error, reconnecting in 5s:", err);
+      conn.gatewayCtx.log?.error(`SSE error, reconnecting in 5s: ${err}`);
       await sleep(5000);
     }
   }
@@ -142,26 +146,76 @@ async function handleNewMessage(conn: ConnectionState, data: SseNewMessageData):
   const latest = history.messages[history.messages.length - 1];
   if (!latest) return;
 
+  const ctx = conn.gatewayCtx;
+  const { channelRuntime } = ctx;
+
+  if (!channelRuntime) {
+    ctx.log?.warn("channelRuntime not available, skipping AI dispatch");
+    return;
+  }
+
+  // Resolve agent route for this sender
+  const route = channelRuntime.routing.resolveAgentRoute({
+    cfg: ctx.cfg,
+    channel: "openswitchy",
+    accountId: ctx.accountId,
+    peer: { kind: "direct", id: data.from.agentId },
+  });
+
+  // Build the inbound envelope body via the SDK runtime
+  const storePath = channelRuntime.session.resolveStorePath(undefined, {
+    agentId: route.agentId,
+  });
+  const envelopeOpts = channelRuntime.reply.resolveEnvelopeFormatOptions(ctx.cfg);
+  const body = channelRuntime.reply.formatAgentEnvelope({
+    channel: "openswitchy",
+    from: data.from.name,
+    timestamp: new Date(latest.createdAt).getTime() || Date.now(),
+    envelope: envelopeOpts,
+    body: latest.content,
+  });
+
   const mentioned =
     data.mentioned === true ||
     (latest.metadata?.mentionedAgentIds || []).includes(conn.agentId);
 
-  const envelope: InboundEnvelope = {
-    channel: "openswitchy",
-    accountId: conn.accountId,
-    from: data.from.agentId,
-    to: data.chatRoomId,
-    body: latest.content,
-    timestamp: new Date(latest.createdAt).getTime() || Date.now(),
-    metadata: {
-      messageId: latest._id || data.messageId,
-      fromName: data.from.name,
-      chatRoomId: data.chatRoomId,
-      mentioned,
-    },
+  // Build MsgContext for the SDK pipeline
+  const msgCtx = {
+    Body: body,
+    From: data.from.agentId,
+    To: data.chatRoomId,
+    AccountId: ctx.accountId,
+    SessionKey: route.sessionKey,
+    ChatType: "direct" as const,
+    SenderName: data.from.name,
   };
 
-  conn.dispatchInbound(envelope);
+  // Record inbound session
+  const chatRoomId = data.chatRoomId;
+  await channelRuntime.session.recordInboundSession({
+    storePath,
+    sessionKey: route.sessionKey,
+    ctx: msgCtx,
+    onRecordError: (err: unknown) => {
+      ctx.log?.error(`Session record error: ${err}`);
+    },
+  });
+
+  // Dispatch AI reply
+  await channelRuntime.reply.dispatchReplyWithBufferedBlockDispatcher({
+    ctx: msgCtx,
+    cfg: ctx.cfg,
+    dispatcherOptions: {
+      deliver: async (payload: ReplyPayload) => {
+        const text = payload.text;
+        if (!text) return;
+        await apiCall(conn.baseUrl, conn.apiKey, "POST", "/chat", {
+          chatRoomId,
+          message: text,
+        });
+      },
+    },
+  });
 }
 
 function sleep(ms: number): Promise<void> {
@@ -189,18 +243,28 @@ export const openswitchyChannel: ChannelPlugin<AccountConfig> = {
   /* ── Config Adapter ── */
   config: {
     listAccountIds(cfg: OpenClawConfig): string[] {
-      const accounts = cfg.channels?.openswitchy?.accounts;
-      if (!accounts) return [];
-      return Object.keys(accounts);
+      const channels = (cfg as Record<string, unknown>).channels as
+        | Record<string, unknown>
+        | undefined;
+      const osSection = channels?.openswitchy as
+        | { accounts?: Record<string, AccountConfig> }
+        | undefined;
+      if (!osSection?.accounts) return [];
+      return Object.keys(osSection.accounts);
     },
 
     resolveAccount(cfg: OpenClawConfig, accountId?: string | null): AccountConfig {
-      const accounts = cfg.channels?.openswitchy?.accounts;
-      if (!accounts) return {};
-      if (accountId && accounts[accountId]) return accounts[accountId];
+      const channels = (cfg as Record<string, unknown>).channels as
+        | Record<string, unknown>
+        | undefined;
+      const osSection = channels?.openswitchy as
+        | { accounts?: Record<string, AccountConfig> }
+        | undefined;
+      if (!osSection?.accounts) return {};
+      if (accountId && osSection.accounts[accountId]) return osSection.accounts[accountId];
       // Fall back to first account
-      const firstKey = Object.keys(accounts)[0];
-      return firstKey ? accounts[firstKey] : {};
+      const firstKey = Object.keys(osSection.accounts)[0];
+      return firstKey ? osSection.accounts[firstKey] : {};
     },
 
     isConfigured(account: AccountConfig): boolean {
@@ -223,10 +287,10 @@ export const openswitchyChannel: ChannelPlugin<AccountConfig> = {
 
       const baseUrl = account.url || DEFAULT_URL;
 
-      console.log(`[openswitchy] Registering "${account.agentName}" at ${baseUrl}`);
+      ctx.log?.info(`Registering "${account.agentName}" at ${baseUrl}`);
       const reg = await registerAgent(account);
-      console.log(
-        `[openswitchy] Registered as ${reg.name} (${reg.agentId}) in "${reg.orgName}" — status: ${reg.status}`,
+      ctx.log?.info(
+        `Registered as ${reg.name} (${reg.agentId}) in "${reg.orgName}" — status: ${reg.status}`,
       );
 
       const conn: ConnectionState = {
@@ -235,9 +299,7 @@ export const openswitchyChannel: ChannelPlugin<AccountConfig> = {
         baseUrl,
         accountId,
         abortController: new AbortController(),
-        dispatchInbound: (envelope) => {
-          ctx.channelRuntime?.reply.dispatchInbound(envelope);
-        },
+        gatewayCtx: ctx,
       };
 
       // Link abort to OpenClaw's signal
@@ -247,7 +309,7 @@ export const openswitchyChannel: ChannelPlugin<AccountConfig> = {
 
       // Start SSE listener (fire-and-forget, reconnects internally)
       listenSse(conn);
-      console.log("[openswitchy] SSE connected, listening for messages");
+      ctx.log?.info("SSE connected, listening for messages");
     },
 
     async stopAccount(ctx: ChannelGatewayContext<AccountConfig>): Promise<void> {
@@ -256,7 +318,7 @@ export const openswitchyChannel: ChannelPlugin<AccountConfig> = {
         conn.abortController.abort();
         connections.delete(ctx.accountId);
       }
-      console.log(`[openswitchy] Disconnected account ${ctx.accountId}`);
+      ctx.log?.info(`Disconnected account ${ctx.accountId}`);
     },
   },
 
@@ -265,7 +327,7 @@ export const openswitchyChannel: ChannelPlugin<AccountConfig> = {
     deliveryMode: "direct",
     textChunkLimit: 4096,
 
-    async sendText(ctx: ChannelOutboundContext): Promise<{ messageId?: string }> {
+    async sendText(ctx: ChannelOutboundContext) {
       const conn = connections.get(ctx.accountId || "");
       if (!conn) {
         throw new Error("[openswitchy] No active connection for this account");
@@ -279,13 +341,15 @@ export const openswitchyChannel: ChannelPlugin<AccountConfig> = {
         { chatRoomId: ctx.to, message: ctx.text },
       );
 
-      return { messageId: result.messageId };
+      return { channel: "openswitchy" as const, messageId: result.messageId };
     },
   },
 
   /* ── Security Adapter ── */
   security: {
-    resolveDmPolicy(ctx: ChannelSecurityContext<AccountConfig>) {
+    resolveDmPolicy(
+      ctx: ChannelSecurityContext<AccountConfig>,
+    ): ChannelSecurityDmPolicy | null {
       return {
         policy: ctx.account.dmPolicy || "open",
         allowFrom: null,
