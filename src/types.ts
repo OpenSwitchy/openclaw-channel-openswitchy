@@ -1,27 +1,143 @@
-/** Minimal OpenClaw types — only what the plugin needs */
+/**
+ * OpenClaw plugin types — matches the real adapter pattern from openclaw SDK.
+ * Only includes what this plugin needs.
+ */
 
-export interface PluginApi {
-  registerChannel(opts: { plugin: ChannelPlugin }): void;
-}
+/* ── Plugin API ── */
 
-export interface ChannelPlugin {
+export interface OpenClawPluginApi {
   id: string;
-  listAccountIds(cfg: OpenClawConfig): string[];
-  resolveAccount(cfg: OpenClawConfig, accountId: string): AccountConfig | undefined;
-  isConfigured(account: AccountConfig): boolean;
-  start(ctx: GatewayContext): Promise<void>;
-  stop(): Promise<void>;
-  sendText(opts: SendTextOpts): Promise<{ ok: boolean }>;
-  resolveDmPolicy(account: AccountConfig): string;
-  textChunkLimit: number;
+  name: string;
+  config: OpenClawConfig;
+  logger: PluginLogger;
+  registerChannel(registration: { plugin: ChannelPlugin }): void;
 }
+
+export interface PluginLogger {
+  info(msg: string, ...args: unknown[]): void;
+  warn(msg: string, ...args: unknown[]): void;
+  error(msg: string, ...args: unknown[]): void;
+}
+
+/* ── Channel Plugin (adapter pattern) ── */
+
+export type ChatType = "direct" | "group";
+
+export interface ChannelPlugin<ResolvedAccount = unknown> {
+  id: string;
+  meta: ChannelMeta;
+  capabilities: ChannelCapabilities;
+  config: ChannelConfigAdapter<ResolvedAccount>;
+  gateway?: ChannelGatewayAdapter<ResolvedAccount>;
+  outbound?: ChannelOutboundAdapter;
+  security?: ChannelSecurityAdapter<ResolvedAccount>;
+}
+
+export interface ChannelMeta {
+  id: string;
+  label: string;
+  selectionLabel: string;
+  docsPath: string;
+  blurb: string;
+  aliases?: string[];
+}
+
+export interface ChannelCapabilities {
+  chatTypes: ChatType[];
+  media?: boolean;
+  reactions?: boolean;
+  threads?: boolean;
+}
+
+/* ── Config Adapter ── */
+
+export interface ChannelConfigAdapter<ResolvedAccount> {
+  listAccountIds(cfg: OpenClawConfig): string[];
+  resolveAccount(cfg: OpenClawConfig, accountId?: string | null): ResolvedAccount;
+  isConfigured?(account: ResolvedAccount, cfg: OpenClawConfig): boolean;
+  isEnabled?(account: ResolvedAccount, cfg: OpenClawConfig): boolean;
+}
+
+/* ── Gateway Adapter ── */
+
+export interface ChannelGatewayAdapter<ResolvedAccount> {
+  startAccount?(ctx: ChannelGatewayContext<ResolvedAccount>): Promise<unknown>;
+  stopAccount?(ctx: ChannelGatewayContext<ResolvedAccount>): Promise<void>;
+}
+
+export interface ChannelGatewayContext<ResolvedAccount> {
+  cfg: OpenClawConfig;
+  accountId: string;
+  account: ResolvedAccount;
+  abortSignal: AbortSignal;
+  log?: { info(msg: string): void; error(msg: string): void };
+  channelRuntime?: PluginChannelRuntime;
+}
+
+export interface PluginChannelRuntime {
+  reply: {
+    dispatchInbound(envelope: InboundEnvelope): void;
+  };
+}
+
+export interface InboundEnvelope {
+  channel: string;
+  accountId: string;
+  from: string;
+  to: string;
+  body: string;
+  timestamp?: number;
+  metadata?: Record<string, unknown>;
+}
+
+/* ── Outbound Adapter ── */
+
+export interface ChannelOutboundAdapter {
+  deliveryMode: "direct" | "gateway" | "hybrid";
+  textChunkLimit?: number;
+  sendText?(ctx: ChannelOutboundContext): Promise<OutboundDeliveryResult>;
+}
+
+export interface ChannelOutboundContext {
+  cfg: OpenClawConfig;
+  to: string;
+  text: string;
+  accountId?: string | null;
+}
+
+export interface OutboundDeliveryResult {
+  messageId?: string;
+}
+
+/* ── Security Adapter ── */
+
+export interface ChannelSecurityAdapter<ResolvedAccount> {
+  resolveDmPolicy?(ctx: ChannelSecurityContext<ResolvedAccount>): ChannelSecurityDmPolicy | null;
+}
+
+export interface ChannelSecurityContext<ResolvedAccount> {
+  cfg: OpenClawConfig;
+  accountId?: string | null;
+  account: ResolvedAccount;
+}
+
+export interface ChannelSecurityDmPolicy {
+  policy: string;
+  allowFrom?: Array<string | number> | null;
+  allowFromPath: string;
+  approveHint: string;
+}
+
+/* ── Config Shape ── */
 
 export interface OpenClawConfig {
   channels?: {
     openswitchy?: {
       accounts?: Record<string, AccountConfig>;
     };
+    [key: string]: unknown;
   };
+  [key: string]: unknown;
 }
 
 export interface AccountConfig {
@@ -33,38 +149,7 @@ export interface AccountConfig {
   dmPolicy?: "open" | "pairing";
 }
 
-export interface GatewayContext {
-  account: AccountConfig;
-  accountId: string;
-  onMessage(msg: StandardMessage): void;
-}
-
-export interface StandardMessage {
-  channel: string;
-  accountId: string;
-  chatId: string;
-  messageId: string;
-  from: {
-    id: string;
-    name: string;
-  };
-  text: string;
-  mentioned: boolean;
-  timestamp: string;
-  target: {
-    chatRoomId: string;
-  };
-}
-
-export interface SendTextOpts {
-  text: string;
-  target: {
-    chatRoomId: string;
-  };
-  accountId: string;
-}
-
-/* OpenSwitchy API response types */
+/* ── OpenSwitchy API response types ── */
 
 export interface RegisterResponse {
   agentId: string;
