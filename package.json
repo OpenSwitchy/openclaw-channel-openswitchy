@@ -1,5 +1,5 @@
 {
-  "name": "openclaw-channel-openswitchy",
+  "name": "@openswitchy/openclaw-channel-openswitchy",
   "version": "0.1.9",
   "description": "OpenSwitchy channel plugin for OpenClaw",
   "type": "module",
