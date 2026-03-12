@@ -1,12 +1,137 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { openswitchyChannel } from "./channel.js";
+import { openswitchyChannel, resolveAgentName, resolveAgentDescription } from "./channel.js";
 import type { AccountConfig } from "./types.js";
+import type { OpenClawConfig } from "openclaw/plugin-sdk";
 
 /* ── Helper to build a fake OpenClawConfig ── */
 
 function makeConfig(accounts?: Record<string, AccountConfig>) {
   return { channels: { openswitchy: { accounts } } } as unknown;
 }
+
+/* ── resolveAgentName ── */
+
+describe("resolveAgentName", () => {
+  function makeCfg(overrides: Record<string, unknown> = {}): OpenClawConfig {
+    return {
+      bindings: [
+        {
+          match: { channel: "openswitchy", accountId: "default" },
+          agentId: "agent-1",
+        },
+      ],
+      agents: {
+        list: [
+          {
+            id: "agent-1",
+            name: "FallbackName",
+            identity: { name: "PaymentsBot" },
+          },
+        ],
+      },
+      ...overrides,
+    } as unknown as OpenClawConfig;
+  }
+
+  it("returns agent identity.name when binding + agent found", () => {
+    const cfg = makeCfg();
+    expect(resolveAgentName(cfg, "default", "fallback")).toBe("PaymentsBot");
+  });
+
+  it("returns agent.name when identity.name is missing", () => {
+    const cfg = makeCfg({
+      agents: {
+        list: [{ id: "agent-1", name: "AgentOne" }],
+      },
+    });
+    expect(resolveAgentName(cfg, "default", "fallback")).toBe("AgentOne");
+  });
+
+  it("returns agentId when agent not in list", () => {
+    const cfg = makeCfg({
+      agents: { list: [] },
+    });
+    expect(resolveAgentName(cfg, "default", "fallback")).toBe("agent-1");
+  });
+
+  it("returns fallback when no binding matches", () => {
+    const cfg = makeCfg({ bindings: [] });
+    expect(resolveAgentName(cfg, "default", "fallback")).toBe("fallback");
+  });
+
+  it("returns fallback when binding has no agentId", () => {
+    const cfg = makeCfg({
+      bindings: [{ match: { channel: "openswitchy", accountId: "default" } }],
+    });
+    expect(resolveAgentName(cfg, "default", "myFallback")).toBe("myFallback");
+  });
+
+  it("matches binding without accountId constraint", () => {
+    const cfg = makeCfg({
+      bindings: [
+        { match: { channel: "openswitchy" }, agentId: "agent-1" },
+      ],
+    });
+    expect(resolveAgentName(cfg, "any-account", "fallback")).toBe("PaymentsBot");
+  });
+
+  it("handles missing bindings and agents gracefully", () => {
+    const cfg = {} as unknown as OpenClawConfig;
+    expect(resolveAgentName(cfg, "default", "safe")).toBe("safe");
+  });
+});
+
+/* ── resolveAgentDescription ── */
+
+describe("resolveAgentDescription", () => {
+  function makeCfg(overrides: Record<string, unknown> = {}): OpenClawConfig {
+    return {
+      bindings: [
+        {
+          match: { channel: "openswitchy", accountId: "default" },
+          agentId: "agent-1",
+        },
+      ],
+      agents: {
+        list: [
+          {
+            id: "agent-1",
+            name: "FallbackName",
+            identity: { name: "PaymentsBot", description: "Handles billing and invoices" },
+          },
+        ],
+      },
+      ...overrides,
+    } as unknown as OpenClawConfig;
+  }
+
+  it("returns identity.description when binding + agent found", () => {
+    const cfg = makeCfg();
+    expect(resolveAgentDescription(cfg, "default", "Fallback")).toBe("Handles billing and invoices");
+  });
+
+  it("falls back to generic description when identity.description missing", () => {
+    const cfg = makeCfg({
+      agents: { list: [{ id: "agent-1", name: "Bot", identity: { name: "Bot" } }] },
+    });
+    expect(resolveAgentDescription(cfg, "default", "Bot")).toBe("OpenClaw agent: Bot");
+  });
+
+  it("falls back to generic description when no binding", () => {
+    const cfg = makeCfg({ bindings: [] });
+    expect(resolveAgentDescription(cfg, "default", "MyBot")).toBe("OpenClaw agent: MyBot");
+  });
+
+  it("falls back to generic description when agent not in list", () => {
+    const cfg = makeCfg({ agents: { list: [] } });
+    expect(resolveAgentDescription(cfg, "default", "MyBot")).toBe("OpenClaw agent: MyBot");
+  });
+
+  it("handles empty config gracefully", () => {
+    const cfg = {} as unknown as OpenClawConfig;
+    expect(resolveAgentDescription(cfg, "default", "Safe")).toBe("OpenClaw agent: Safe");
+  });
+});
 
 /* ── Config Adapter ── */
 
@@ -52,7 +177,11 @@ describe("config adapter", () => {
     expect(account).toEqual({});
   });
 
-  it("isConfigured returns true when joinCode and agentName are set", () => {
+  it("isConfigured returns true when joinCode is set", () => {
+    expect(config.isConfigured!({ joinCode: "abc" }, {} as any)).toBe(true);
+  });
+
+  it("isConfigured returns true when joinCode + agentName are set", () => {
     expect(config.isConfigured!({ joinCode: "abc", agentName: "Bot" }, {} as any)).toBe(true);
   });
 
@@ -60,8 +189,8 @@ describe("config adapter", () => {
     expect(config.isConfigured!({ agentName: "Bot" }, {} as any)).toBe(false);
   });
 
-  it("isConfigured returns false when agentName is missing", () => {
-    expect(config.isConfigured!({ joinCode: "abc" }, {} as any)).toBe(false);
+  it("isConfigured returns false for empty config", () => {
+    expect(config.isConfigured!({}, {} as any)).toBe(false);
   });
 
   it("isEnabled returns true by default", () => {
@@ -172,25 +301,126 @@ describe("gateway adapter", () => {
       getStatus: vi.fn(),
       setStatus: vi.fn(),
     };
-    await expect(gateway.startAccount!(ctx as any)).rejects.toThrow("Missing joinCode or agentName");
+    await expect(gateway.startAccount!(ctx as any)).rejects.toThrow("Missing joinCode");
   });
 
-  it("startAccount throws when agentName is missing", async () => {
+  it("startAccount works without agentName (auto-resolves)", async () => {
+    const mockFetch = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({
+          agentId: "agent-1",
+          name: "ResolvedBot",
+          orgId: "org-1",
+          orgName: "TestOrg",
+          apiKey: "sb_test_key",
+          status: "approved",
+          message: "Registered",
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        body: {
+          getReader: () => ({
+            read: () => new Promise(() => {}),
+          }),
+        },
+      });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const abortController = new AbortController();
     const ctx = {
-      cfg: {} as any,
-      accountId: "test",
-      account: { joinCode: "abc" } as AccountConfig,
-      abortSignal: new AbortController().signal,
+      cfg: {
+        bindings: [
+          { match: { channel: "openswitchy", accountId: "test-acc" }, agentId: "agent-1" },
+        ],
+        agents: {
+          list: [{ id: "agent-1", name: "AutoBot", identity: { name: "AutoResolvedName", description: "Auto-resolved description from config" } }],
+        },
+      } as any,
+      accountId: "test-acc",
+      account: { joinCode: "abc", url: "http://localhost:3000" } as AccountConfig,
+      abortSignal: abortController.signal,
       runtime: {} as any,
       getStatus: vi.fn(),
       setStatus: vi.fn(),
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
     };
-    await expect(gateway.startAccount!(ctx as any)).rejects.toThrow("Missing joinCode or agentName");
+
+    // Abort after a tick so startAccount unblocks
+    setTimeout(() => abortController.abort(), 50);
+    await gateway.startAccount!(ctx as any);
+
+    // Should register with auto-resolved name and description
+    const registerCall = mockFetch.mock.calls[0];
+    const body = JSON.parse(registerCall[1].body);
+    expect(body.name).toBe("AutoResolvedName");
+    expect(body.description).toBe("Auto-resolved description from config");
+
+    vi.unstubAllGlobals();
+  });
+
+  it("startAccount prefers manual agentName over auto-resolved", async () => {
+    const mockFetch = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({
+          agentId: "agent-1",
+          name: "ManualBot",
+          orgId: "org-1",
+          orgName: "TestOrg",
+          apiKey: "sb_test_key",
+          status: "approved",
+          message: "Registered",
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        body: {
+          getReader: () => ({
+            read: () => new Promise(() => {}),
+          }),
+        },
+      });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const abortController = new AbortController();
+    const ctx = {
+      cfg: {
+        bindings: [
+          { match: { channel: "openswitchy", accountId: "test-acc" }, agentId: "agent-1" },
+        ],
+        agents: {
+          list: [{ id: "agent-1", identity: { name: "AutoName" } }],
+        },
+      } as any,
+      accountId: "test-acc",
+      account: {
+        joinCode: "abc",
+        agentName: "ManualBot",
+        agentDescription: "Custom description",
+        url: "http://localhost:3000",
+      } as AccountConfig,
+      abortSignal: abortController.signal,
+      runtime: {} as any,
+      getStatus: vi.fn(),
+      setStatus: vi.fn(),
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+    };
+
+    setTimeout(() => abortController.abort(), 50);
+    await gateway.startAccount!(ctx as any);
+
+    const registerCall = mockFetch.mock.calls[0];
+    const body = JSON.parse(registerCall[1].body);
+    expect(body.name).toBe("ManualBot");
+    expect(body.description).toBe("Custom description");
+
+    vi.unstubAllGlobals();
   });
 
   it("startAccount registers and stores connection", async () => {
     const mockFetch = vi.fn()
-      // registration call
       .mockResolvedValueOnce({
         ok: true,
         json: () => Promise.resolve({
@@ -203,12 +433,11 @@ describe("gateway adapter", () => {
           message: "Registered",
         }),
       })
-      // SSE call (return a never-resolving body to keep SSE alive)
       .mockResolvedValueOnce({
         ok: true,
         body: {
           getReader: () => ({
-            read: () => new Promise(() => {}), // hangs forever (SSE stream)
+            read: () => new Promise(() => {}),
           }),
         },
       });
@@ -226,9 +455,9 @@ describe("gateway adapter", () => {
       log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
     };
 
+    setTimeout(() => abortController.abort(), 50);
     await gateway.startAccount!(ctx as any);
 
-    // Verify registration was called
     expect(mockFetch).toHaveBeenCalledWith(
       "http://localhost:3000/register",
       expect.objectContaining({
@@ -236,9 +465,6 @@ describe("gateway adapter", () => {
         body: expect.stringContaining('"joinCode":"abc"'),
       }),
     );
-
-    // Cleanup
-    abortController.abort();
 
     vi.unstubAllGlobals();
   });
@@ -255,7 +481,6 @@ describe("gateway adapter", () => {
       log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
     };
 
-    // Should not throw even if no connection exists
     await expect(gateway.stopAccount!(ctx as any)).resolves.toBeUndefined();
   });
 });

@@ -1,3 +1,7 @@
+import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { join } from "node:path";
+import { homedir } from "node:os";
+
 import type {
   ChannelPlugin,
   ChannelGatewayContext,
@@ -16,6 +20,55 @@ import type {
 } from "./types.js";
 
 const DEFAULT_URL = "https://openswitchy.com";
+const API_KEY_FILE = join(homedir(), ".openclaw", "openswitchy-keys.json");
+
+/* ── Agent name resolution ── */
+
+export function resolveAgentName(
+  cfg: OpenClawConfig,
+  accountId: string,
+  fallback: string,
+): string {
+  const binding = ((cfg as Record<string, unknown>).bindings as Array<{
+    match?: { channel?: string; accountId?: string };
+    agentId?: string;
+  }> || []).find(
+    (b) =>
+      b.match?.channel === "openswitchy" &&
+      (!b.match?.accountId || b.match.accountId === accountId),
+  );
+  if (!binding || !binding.agentId) return fallback;
+  const agent = findBoundAgent(cfg, binding.agentId);
+  return agent?.identity?.name || agent?.name || binding.agentId || fallback;
+}
+
+export function resolveAgentDescription(
+  cfg: OpenClawConfig,
+  accountId: string,
+  fallbackName: string,
+): string {
+  const binding = ((cfg as Record<string, unknown>).bindings as Array<{
+    match?: { channel?: string; accountId?: string };
+    agentId?: string;
+  }> || []).find(
+    (b) =>
+      b.match?.channel === "openswitchy" &&
+      (!b.match?.accountId || b.match.accountId === accountId),
+  );
+  if (!binding || !binding.agentId) return `OpenClaw agent: ${fallbackName}`;
+  const agent = findBoundAgent(cfg, binding.agentId);
+  return agent?.identity?.description || `OpenClaw agent: ${fallbackName}`;
+}
+
+function findBoundAgent(
+  cfg: OpenClawConfig,
+  agentId: string,
+): { id: string; name?: string; identity?: { name?: string; description?: string } } | undefined {
+  const agents = ((cfg as Record<string, unknown>).agents as {
+    list?: Array<{ id: string; name?: string; identity?: { name?: string; description?: string } }>;
+  })?.list || [];
+  return agents.find((a) => a.id === agentId);
+}
 
 /** Per-account connection state */
 interface ConnectionState {
@@ -29,6 +82,33 @@ interface ConnectionState {
 
 const connections = new Map<string, ConnectionState>();
 
+/** Get a live connection by accountId (used by tools) */
+export function getConnection(accountId: string): ConnectionState | undefined {
+  return connections.get(accountId) || connections.values().next().value;
+}
+
+/* ── Persistent API key cache (survives process restart) ── */
+
+async function loadApiKey(accountId: string): Promise<string | undefined> {
+  try {
+    const data = await readFile(API_KEY_FILE, "utf-8");
+    const keys = JSON.parse(data) as Record<string, string>;
+    return keys[accountId];
+  } catch {
+    return undefined;
+  }
+}
+
+async function saveApiKey(accountId: string, apiKey: string): Promise<void> {
+  let keys: Record<string, string> = {};
+  try {
+    keys = JSON.parse(await readFile(API_KEY_FILE, "utf-8"));
+  } catch { /* first write */ }
+  keys[accountId] = apiKey;
+  await mkdir(join(homedir(), ".openclaw"), { recursive: true });
+  await writeFile(API_KEY_FILE, JSON.stringify(keys, null, 2), "utf-8");
+}
+
 /* ── HTTP helpers ── */
 
 function makeHeaders(apiKey: string): Record<string, string> {
@@ -38,7 +118,7 @@ function makeHeaders(apiKey: string): Record<string, string> {
   };
 }
 
-async function apiCall<T>(
+export async function apiCall<T>(
   baseUrl: string,
   apiKey: string,
   method: string,
@@ -57,16 +137,20 @@ async function apiCall<T>(
   return res.json() as Promise<T>;
 }
 
-async function registerAgent(account: AccountConfig): Promise<RegisterResponse> {
-  const url = account.url || DEFAULT_URL;
-  const res = await fetch(`${url}/register`, {
+async function registerAgent(
+  baseUrl: string,
+  joinCode: string,
+  name: string,
+  description: string,
+  cachedApiKey?: string,
+): Promise<RegisterResponse> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (cachedApiKey) headers.Authorization = `Bearer ${cachedApiKey}`;
+
+  const res = await fetch(`${baseUrl}/register`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      name: account.agentName,
-      description: account.agentDescription || `OpenClaw agent: ${account.agentName}`,
-      joinCode: account.joinCode,
-    }),
+    headers,
+    body: JSON.stringify({ name, description, joinCode }),
   });
   if (!res.ok) {
     const text = await res.text();
@@ -268,7 +352,7 @@ export const openswitchyChannel: ChannelPlugin<AccountConfig> = {
     },
 
     isConfigured(account: AccountConfig): boolean {
-      return Boolean(account.joinCode && account.agentName);
+      return Boolean(account.joinCode);
     },
 
     isEnabled(account: AccountConfig): boolean {
@@ -281,17 +365,24 @@ export const openswitchyChannel: ChannelPlugin<AccountConfig> = {
     async startAccount(ctx: ChannelGatewayContext<AccountConfig>): Promise<void> {
       const { account, accountId, abortSignal } = ctx;
 
-      if (!account.joinCode || !account.agentName) {
-        throw new Error("[openswitchy] Missing joinCode or agentName in config");
+      if (!account.joinCode) {
+        throw new Error("[openswitchy] Missing joinCode in config");
       }
 
       const baseUrl = account.url || DEFAULT_URL;
+      const resolvedName = account.agentName || resolveAgentName(ctx.cfg, accountId, accountId);
+      const resolvedDescription =
+        account.agentDescription || resolveAgentDescription(ctx.cfg, accountId, resolvedName);
 
-      ctx.log?.info(`Registering "${account.agentName}" at ${baseUrl}`);
-      const reg = await registerAgent(account);
+      const cached = await loadApiKey(accountId);
+      ctx.log?.info(`Registering "${resolvedName}" at ${baseUrl}${cached ? " (reconnect)" : ""}`);
+      const reg = await registerAgent(baseUrl, account.joinCode, resolvedName, resolvedDescription, cached);
       ctx.log?.info(
         `Registered as ${reg.name} (${reg.agentId}) in "${reg.orgName}" — status: ${reg.status}`,
       );
+
+      // Persist key for reconnection (survives process restart)
+      await saveApiKey(accountId, reg.apiKey);
 
       const conn: ConnectionState = {
         apiKey: reg.apiKey,
@@ -307,9 +398,14 @@ export const openswitchyChannel: ChannelPlugin<AccountConfig> = {
 
       connections.set(accountId, conn);
 
-      // Start SSE listener (fire-and-forget, reconnects internally)
+      // Start SSE listener (reconnects internally)
       listenSse(conn);
       ctx.log?.info("SSE connected, listening for messages");
+
+      // Block until OpenClaw signals abort — returning early causes auto-restart loops
+      await new Promise<void>((resolve) => {
+        abortSignal.addEventListener("abort", () => resolve());
+      });
     },
 
     async stopAccount(ctx: ChannelGatewayContext<AccountConfig>): Promise<void> {
@@ -342,6 +438,23 @@ export const openswitchyChannel: ChannelPlugin<AccountConfig> = {
       );
 
       return { channel: "openswitchy" as const, messageId: result.messageId };
+    },
+  },
+
+  /* ── Agent Prompt Adapter ── */
+  agentPrompt: {
+    messageToolHints() {
+      return [
+        "You are connected to OpenSwitchy, a messaging network for AI agents.",
+        "You can proactively discover and message other agents using openswitchy_* tools:",
+        "- openswitchy_find_agents: search for agents by capability or list all",
+        "- openswitchy_send_message: send a 1:1 or group message (use agent UUID, not name)",
+        "- openswitchy_check_inbox: check all unread messages (call periodically to stay updated)",
+        "- openswitchy_list_chats: list conversations with unread counts",
+        "- openswitchy_get_chat_history: read messages from a specific chat room",
+        "- openswitchy_create_group: create a group chat with multiple agents",
+        "Always use openswitchy_find_agents first to get agent UUIDs before sending messages.",
+      ];
     },
   },
 

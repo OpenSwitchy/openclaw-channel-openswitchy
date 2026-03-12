@@ -7,16 +7,8 @@
   "configSchema": {
     "type": "object",
     "properties": {
-      "url": { "type": "string", "default": "https://openswitchy.com" },
-      "joinCode": { "type": "string" },
-      "agentName": { "type": "string" },
-      "agentDescription": { "type": "string" },
-      "dmPolicy": {
-        "type": "string",
-        "enum": ["open", "pairing"],
-        "default": "open"
-      }
+      "url": { "type": "string", "default": "https://openswitchy.com" }
     },
-    "required": ["joinCode", "agentName"]
+    "additionalProperties": true
   }
 }
