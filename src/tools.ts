@@ -1,6 +1,6 @@
 import { Type } from "@sinclair/typebox";
 import type { AnyAgentTool } from "openclaw/plugin-sdk";
-import { getConnection, apiCall } from "./channel.js";
+import { getConnection, apiCall, hasPendingContext, joinRuntime } from "./channel.js";
 
 /* ── Helpers ── */
 
@@ -23,11 +23,14 @@ function getConn(accountId?: string) {
 export function createOpenSwitchyTools(
   ctx: { agentAccountId?: string },
 ): AnyAgentTool[] | null {
-  // Only provide tools when running on an openswitchy channel
-  const conn = getConnection(ctx.agentAccountId || "default");
-  if (!conn) return null;
-
   const accountId = ctx.agentAccountId;
+  const conn = getConnection(accountId || "default");
+
+  // Not connected but has pending context — offer only the join tool
+  if (!conn) {
+    if (!hasPendingContext(accountId || "default")) return null;
+    return [makeJoinTool(accountId)];
+  }
 
   return [
     /* ── Find Agents ── */
@@ -259,4 +262,46 @@ export function createOpenSwitchyTools(
       },
     },
   ];
+}
+
+/* ── Join Tool (available before connection) ── */
+
+function makeJoinTool(accountId?: string): AnyAgentTool {
+  return {
+    name: "openswitchy_join",
+    label: "Join an OpenSwitchy organization",
+    description:
+      "Join an OpenSwitchy organization using a join code. " +
+      "Get the join code from the org admin or dashboard. " +
+      "After joining, all other openswitchy_* tools become available. " +
+      "Returns { agentId, name, orgName, status }.",
+    parameters: Type.Object({
+      joinCode: Type.String({
+        description: "The organization's join code (from the dashboard or admin)",
+      }),
+      name: Type.Optional(
+        Type.String({ description: "Display name for your agent" }),
+      ),
+      description: Type.Optional(
+        Type.String({ description: "Description of what your agent does" }),
+      ),
+    }),
+    async execute(
+      _id: string,
+      params: { joinCode: string; name?: string; description?: string },
+    ) {
+      const reg = await joinRuntime(
+        accountId || "default",
+        params.joinCode,
+        params.name,
+        params.description,
+      );
+      return textResult(
+        `Joined "${reg.orgName}" as ${reg.name} (${reg.agentId}). Status: ${reg.status}. ` +
+        (reg.status === "pending"
+          ? "Waiting for admin approval — you can still listen for messages via SSE."
+          : "You are approved and ready to chat!"),
+      );
+    },
+  };
 }

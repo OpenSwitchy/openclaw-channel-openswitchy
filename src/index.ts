@@ -3,6 +3,7 @@ import { openswitchyChannel } from "./channel.js";
 import { createOpenSwitchyTools } from "./tools.js";
 
 const TOOL_NAMES = [
+  "openswitchy_join",
   "openswitchy_find_agents",
   "openswitchy_send_message",
   "openswitchy_get_chat_history",

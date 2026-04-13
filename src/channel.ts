@@ -82,9 +82,65 @@ interface ConnectionState {
 
 const connections = new Map<string, ConnectionState>();
 
+/** Pending gateway contexts for accounts waiting for runtime join */
+const pendingContexts = new Map<string, { ctx: ChannelGatewayContext<AccountConfig>; baseUrl: string }>();
+
 /** Get a live connection by accountId (used by tools) */
 export function getConnection(accountId: string): ConnectionState | undefined {
   return connections.get(accountId) || connections.values().next().value;
+}
+
+/** Check if an account has a pending context (not yet joined) */
+export function hasPendingContext(accountId: string): boolean {
+  return pendingContexts.has(accountId) || pendingContexts.size > 0;
+}
+
+/** Join an OpenSwitchy org at runtime (called from openswitchy_join tool) */
+export async function joinRuntime(
+  accountId: string,
+  joinCode: string,
+  name?: string,
+  description?: string,
+): Promise<RegisterResponse> {
+  let resolvedId = accountId;
+  let pending = pendingContexts.get(accountId);
+  if (!pending) {
+    const entry = pendingContexts.entries().next().value as
+      | [string, { ctx: ChannelGatewayContext<AccountConfig>; baseUrl: string }]
+      | undefined;
+    if (entry) { resolvedId = entry[0]; pending = entry[1]; }
+  }
+  if (!pending) {
+    throw new Error("No pending OpenSwitchy context — is the channel configured and running?");
+  }
+
+  const { ctx, baseUrl } = pending;
+  const resolvedName = name || resolveAgentName(ctx.cfg, resolvedId, resolvedId);
+  const resolvedDesc = description || resolveAgentDescription(ctx.cfg, resolvedId, resolvedName);
+
+  const cached = await loadApiKey(resolvedId);
+  ctx.log?.info(`Runtime join: "${resolvedName}" at ${baseUrl}${cached ? " (reconnect)" : ""}`);
+  const reg = await registerAgent(baseUrl, joinCode, resolvedName, resolvedDesc, cached);
+  ctx.log?.info(`Registered as ${reg.name} (${reg.agentId}) in "${reg.orgName}" — status: ${reg.status}`);
+
+  await saveApiKey(resolvedId, reg.apiKey);
+
+  const conn: ConnectionState = {
+    apiKey: reg.apiKey,
+    agentId: reg.agentId,
+    baseUrl,
+    accountId: resolvedId,
+    abortController: new AbortController(),
+    gatewayCtx: ctx,
+  };
+
+  ctx.abortSignal.addEventListener("abort", () => conn.abortController.abort());
+  connections.set(resolvedId, conn);
+  pendingContexts.delete(resolvedId);
+  listenSse(conn);
+  ctx.log?.info("SSE connected, listening for messages");
+
+  return reg;
 }
 
 /* ── Persistent API key cache (survives process restart) ── */
@@ -352,7 +408,8 @@ export const openswitchyChannel: ChannelPlugin<AccountConfig> = {
     },
 
     isConfigured(account: AccountConfig): boolean {
-      return Boolean(account.joinCode);
+      // Allow startup without joinCode — agent can join at runtime via openswitchy_join tool
+      return true;
     },
 
     isEnabled(account: AccountConfig): boolean {
@@ -365,44 +422,43 @@ export const openswitchyChannel: ChannelPlugin<AccountConfig> = {
     async startAccount(ctx: ChannelGatewayContext<AccountConfig>): Promise<void> {
       const { account, accountId, abortSignal } = ctx;
 
-      if (!account.joinCode) {
-        throw new Error("[openswitchy] Missing joinCode in config");
+      const baseUrl = account.url || DEFAULT_URL;
+
+      // If joinCode is provided, register immediately (original behavior)
+      if (account.joinCode) {
+        const resolvedName = account.agentName || resolveAgentName(ctx.cfg, accountId, accountId);
+        const resolvedDescription =
+          account.agentDescription || resolveAgentDescription(ctx.cfg, accountId, resolvedName);
+
+        const cached = await loadApiKey(accountId);
+        ctx.log?.info(`Registering "${resolvedName}" at ${baseUrl}${cached ? " (reconnect)" : ""}`);
+        const reg = await registerAgent(baseUrl, account.joinCode, resolvedName, resolvedDescription, cached);
+        ctx.log?.info(
+          `Registered as ${reg.name} (${reg.agentId}) in "${reg.orgName}" — status: ${reg.status}`,
+        );
+
+        await saveApiKey(accountId, reg.apiKey);
+
+        const conn: ConnectionState = {
+          apiKey: reg.apiKey,
+          agentId: reg.agentId,
+          baseUrl,
+          accountId,
+          abortController: new AbortController(),
+          gatewayCtx: ctx,
+        };
+
+        abortSignal.addEventListener("abort", () => conn.abortController.abort());
+        connections.set(accountId, conn);
+        listenSse(conn);
+        ctx.log?.info("SSE connected, listening for messages");
+      } else {
+        // No joinCode — store a pending context so openswitchy_join can connect later
+        pendingContexts.set(accountId, { ctx, baseUrl });
+        ctx.log?.info("No joinCode configured — waiting for runtime join via openswitchy_join tool");
       }
 
-      const baseUrl = account.url || DEFAULT_URL;
-      const resolvedName = account.agentName || resolveAgentName(ctx.cfg, accountId, accountId);
-      const resolvedDescription =
-        account.agentDescription || resolveAgentDescription(ctx.cfg, accountId, resolvedName);
-
-      const cached = await loadApiKey(accountId);
-      ctx.log?.info(`Registering "${resolvedName}" at ${baseUrl}${cached ? " (reconnect)" : ""}`);
-      const reg = await registerAgent(baseUrl, account.joinCode, resolvedName, resolvedDescription, cached);
-      ctx.log?.info(
-        `Registered as ${reg.name} (${reg.agentId}) in "${reg.orgName}" — status: ${reg.status}`,
-      );
-
-      // Persist key for reconnection (survives process restart)
-      await saveApiKey(accountId, reg.apiKey);
-
-      const conn: ConnectionState = {
-        apiKey: reg.apiKey,
-        agentId: reg.agentId,
-        baseUrl,
-        accountId,
-        abortController: new AbortController(),
-        gatewayCtx: ctx,
-      };
-
-      // Link abort to OpenClaw's signal
-      abortSignal.addEventListener("abort", () => conn.abortController.abort());
-
-      connections.set(accountId, conn);
-
-      // Start SSE listener (reconnects internally)
-      listenSse(conn);
-      ctx.log?.info("SSE connected, listening for messages");
-
-      // Block until OpenClaw signals abort — returning early causes auto-restart loops
+      // Block until OpenClaw signals abort
       await new Promise<void>((resolve) => {
         abortSignal.addEventListener("abort", () => resolve());
       });
@@ -446,6 +502,7 @@ export const openswitchyChannel: ChannelPlugin<AccountConfig> = {
     messageToolHints() {
       return [
         "You are connected to OpenSwitchy, a messaging network for AI agents.",
+        "If not yet joined, use openswitchy_join with a join code to connect to an org.",
         "You can proactively discover and message other agents using openswitchy_* tools:",
         "- openswitchy_find_agents: search for agents by capability or list all",
         "- openswitchy_send_message: send a 1:1 or group message (use agent UUID, not name)",
