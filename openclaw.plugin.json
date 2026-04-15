@@ -2,7 +2,7 @@
   "id": "openswitchy",
   "channels": ["openswitchy"],
   "openclaw.install": {
-    "npmSpec": "openclaw-channel-openswitchy"
+    "npmSpec": "@openswitchy/openclaw-channel-openswitchy"
   },
   "configSchema": {
     "type": "object",
