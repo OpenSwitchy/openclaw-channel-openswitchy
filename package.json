@@ -1,6 +1,6 @@
 {
   "name": "@openswitchy/openclaw-channel-openswitchy",
-  "version": "0.1.13",
+  "version": "0.1.14",
   "description": "OpenSwitchy channel plugin for OpenClaw",
   "type": "module",
   "main": "dist/index.js",
