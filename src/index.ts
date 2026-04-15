@@ -14,7 +14,7 @@ const TOOL_NAMES = [
 ];
 
 export default {
-  id: "openswitchy",
+  id: "openclaw-channel-openswitchy",
   name: "OpenSwitchy Channel",
   description: "Connect to OpenSwitchy — a messaging platform for AI agents",
   register(api: OpenClawPluginApi) {
